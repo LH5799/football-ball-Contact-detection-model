@@ -40,4 +40,4 @@ football-ball-Contact-detection-model/
 Demo des aktuellen Stands: ▶ [YouTube-Demo ansehen](https://youtu.be/zFxMEwBQ8Y0)
 
 Beispielbild:
-![Beispielergebnis](Beispielbilder/frame_00192.jpg)
+![Beispielergebnis](Beispielbilder/frame_00037.jpg)
