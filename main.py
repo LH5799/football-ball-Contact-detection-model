@@ -7,6 +7,10 @@ import pandas as pd
 import numpy as np
 import torch
 import time
+import torchvision.transforms as T
+from torchvision.transforms.functional import resize as tv_resize
+from torchvision.transforms.functional import to_tensor, normalize
+import torch.nn.functional as F
 
 start = time.perf_counter()
 
@@ -14,14 +18,24 @@ device = torch.device("mps") if torch.backends.mps.is_available() else torch.dev
 print(f"Using device: {device}")
 
 # Modelle laden
-object_model = YOLO("PATH_TO/player_detection_model.pt").to(device)
+object_model = YOLO("PATH_TO_PLAYER_DETECTION_MODEL").to(device)
 pose_model = YOLO("yolo11x-pose.pt").to(device)
+
+#Modell zur Tiefenschätzung
+midas_model_type = "DPT_Large"
+midas = torch.hub.load("intel-isl/MiDaS", midas_model_type).to(device).eval()
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+
+if midas_model_type in ["DPT_Large", "DPT_Hybrid"]:
+    transform = midas_transforms.dpt_transform
+else:
+    transform = midas_transforms.small_transform
 
 #Tracker initialisieren
 tracker = sv.ByteTrack()
 
 # Video-Pfade
-video_path = "INPUT_PATH"
+video_path = "PATH_TO_VIDEO"
 output_dir = "OUTPUT_PATH"
 os.makedirs(output_dir, exist_ok=True)
 
@@ -43,7 +57,7 @@ keypoint_names = [
     "left_knee", "right_knee", "left_ankle", "right_ankle"
 ]
 columns = ["Bildname", "PersonID"] + [f"{kp}_{axis}" for kp in keypoint_names for axis in ["x", "y"]]
-data = []
+
 
 frame_idx = 0
 while cap.isOpened():
@@ -57,27 +71,29 @@ while cap.isOpened():
     output_img_path = os.path.join(output_dir, img_name)
 
     # Objekterkennung
-    results = object_model(image, conf=0.5)[0]
+    results = object_model(image, conf=0.55)[0]
     sv_detections = sv.Detections.from_ultralytics(results)
     tracked_detections = tracker.update_with_detections(sv_detections)
 
     player_crops = []
     player_boxes = []
     tracked_ids = []
+    frame_keypoints = []
 
     used_ids = set()
 
-    for i in range(len(sv_detections)):
-        box = sv_detections.xyxy[i]
-        cls_id = int(sv_detections.class_id[i])
-        conf = float(sv_detections.confidence[i])
+    ball_contact_detected = False 
+
+    for i in range(len(tracked_detections)):
+        box = tracked_detections.xyxy[i]
+        cls_id = int(tracked_detections.class_id[i])
+        conf = float(tracked_detections.confidence[i])
         class_name = object_model.names[cls_id]
 
-        # Setze ID
         if class_name == "ball":
             track_id = 1
         else:
-            original_id = sv_detections.tracker_id[i]
+            original_id = tracked_detections.tracker_id[i]
             if original_id == 1 or original_id in used_ids:
                 new_id = 2
                 while new_id in used_ids:
@@ -91,12 +107,10 @@ while cap.isOpened():
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(width, x2), min(height, y2)
 
-        # Bounding Box zeichnen
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 1)
         cv2.putText(image, f"{class_name} {conf:.2f} ID:{track_id}", (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # Filtere nur Spieler (player, goalkeeper)
         if class_name not in ["player", "goalkeeper"]:
             continue
 
@@ -126,6 +140,8 @@ while cap.isOpened():
 
         batch_tensor = torch.from_numpy(batch).permute(0, 3, 1, 2).to(device).float() / 255.0
         pose_results = pose_model(batch_tensor, conf=0.55)
+        frame_keypoints = []
+
 
         # Keypoints relativ zum Crop auf Originalbild übertragen und zeichnen
         for i, pose_result in enumerate(pose_results):
@@ -163,7 +179,113 @@ while cap.isOpened():
                     else:
                         keypoints_flat.extend([np.nan, np.nan])
 
-                data.append([img_name, tracked_ids[i]] + keypoints_flat)
+                frame_keypoints.append([img_name, tracked_ids[i]] + keypoints_flat)
+
+    # Hole Ball-Position (Mittelpunkt)
+    ball_coords = None
+    x1b = y1b = x2b = y2b = None 
+    for i in range(len(tracked_detections)):
+        ball_class_id = next(k for k, v in object_model.names.items() if v == "ball")
+        if int(tracked_detections.class_id[i]) == ball_class_id:
+            x1b, y1b, x2b, y2b = map(int, tracked_detections.xyxy[i])
+            ball_coords = ((x1b + x2b) // 2, (y1b + y2b) // 2)
+            break
+    
+    # Nur wenn Ball erkannt wurde
+    if ball_coords and x1b is not None:
+        bx, by = ball_coords
+
+
+        close_keypoints = []
+
+        for row in frame_keypoints:
+            person_id = row[1]
+            for kp_idx in range(len(keypoint_names)):
+                x = row[2 + kp_idx * 2]
+                y = row[2 + kp_idx * 2 + 1]
+
+                if not np.isnan(x) and not np.isnan(y):
+                    px, py = x, y
+
+                    # Berechne Abstand des Keypoints zur Bounding Box
+                    dx = max(x1b - px, 0, px - x2b)
+                    dy = max(y1b - py, 0, py - y2b)
+                    dist_to_box = np.hypot(dx, dy)
+
+
+                    #Berechne Ballgröße
+                    ball_width = x2b - x1b
+                    ball_height = y2b - y1b
+                    ball_diag = np.sqrt(ball_width ** 2 + ball_height ** 2)
+
+                    # Setze Schwelle in Relation zur Ballgröße
+                    dynamic_threshold = max(ball_diag * 0.4, 30)
+
+                    #if dist_2d < dynamic_threshold:
+                    if dist_to_box < dynamic_threshold:
+                        close_keypoints.append((int(x), int(y), person_id, keypoint_names[kp_idx]))
+
+        # Wenn mindestens ein Keypoint nah: MiDaS Tiefe berechnen
+        if close_keypoints:
+            # MiDaS-Eingabe vorbereiten
+            input_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_transformed = transform(input_rgb)
+            if isinstance(input_transformed, tuple):
+                input_transformed = input_transformed[0]
+            input_transformed = input_transformed.to(device)
+
+            with torch.no_grad():
+                prediction = midas(input_transformed)
+                prediction_cpu = prediction.cpu()
+
+                prediction_resized = torch.nn.functional.interpolate(
+                    prediction_cpu.unsqueeze(1),
+                    size=frame.shape[:2],
+                    mode="bicubic",
+                    align_corners=False
+                ).squeeze()
+
+                # Tiefe des Balls bestimmen
+                ball_depth = prediction_resized[by, bx].item()
+
+                for (x, y, person_id, kp_name) in close_keypoints:
+                    keypoint_depth = prediction_resized[int(y), int(x)].item()
+                    depth_diff = abs(keypoint_depth - ball_depth)
+
+                    # Schwelle für "ähnliche Tiefe" (z. B. 10% des Tiefenwerts oder absolut < 0.1)
+                    relative_thresh = 0.03 * ball_depth
+                    absolute_thresh = 0.005
+                    if depth_diff < max(relative_thresh, absolute_thresh):
+                        ball_contact_detected = True
+                        cv2.circle(image, (x, y), 7, (0, 255, 255), 2)
+                        cv2.putText(image, f"Kontakt: {kp_name}", (x + 5, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
+    # Anzeige der Ballkontakt-Information
+    label_text = "potenzieller Ballkontakt" if ball_contact_detected else "kein Ballkontakt"
+
+    # Schrift-Eigenschaften
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 2.0
+    font_thickness = 3
+    text_size, _ = cv2.getTextSize(label_text, font, font_scale, font_thickness)
+
+    # Position: zentriert unten
+    text_x = (width - text_size[0]) // 2
+    text_y = height - 30  # 30 Pixel vom unteren Rand
+
+    # Hintergrund-Rechteck
+    rect_x1 = text_x - 20
+    rect_y1 = text_y - text_size[1] - 20
+    rect_x2 = text_x + text_size[0] + 20
+    rect_y2 = text_y + 20
+
+    # Zeichne schwarzen Hintergrund
+    cv2.rectangle(image, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), thickness=-1)
+
+    # Zeichne Text
+    text_color = (255, 255, 255) if not ball_contact_detected else (255, 0, 255)
+    cv2.putText(image, label_text, (text_x, text_y), font, font_scale, text_color, font_thickness)
 
     cv2.imwrite(output_img_path, image)
     out_video.write(image)
@@ -172,10 +294,6 @@ while cap.isOpened():
 # Cleanup
 cap.release()
 out_video.release()
-
-# CSV speichern
-df = pd.DataFrame(data, columns=columns)
-df.to_csv(os.path.join(output_dir, "yolo_pose_data.csv"), index=False)
 
 print("✅ Optimiert fertig – Einzel-Inferenz verwendet")
 
