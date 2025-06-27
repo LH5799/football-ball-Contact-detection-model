@@ -1,4 +1,5 @@
 # KI-Modell zur Erkennung von Ballkontakten in Fußball-Spielszenen
+▶ [YouTube-Demo ansehen](https://youtu.be/zFxMEwBQ8Y0)
 
 ## Woraus besteht das Modell?
 ```text
